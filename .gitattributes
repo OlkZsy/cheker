@@ -1,0 +1,6 @@
+# cmd.exe требует CRLF и не понимает UTF-8 в batch-файлах
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.sh text eol=lf
+*.command text eol=lf
+*.py text eol=lf

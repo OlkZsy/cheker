@@ -15,8 +15,22 @@ import threading
 import webbrowser
 from pathlib import Path
 
-import tkinter as tk
-from tkinter import messagebox, ttk
+try:
+    import tkinter as tk
+    from tkinter import messagebox, ttk
+except ImportError:  # Python без tcl/tk — окно построить не на чем
+    print(
+        "Не найден модуль tkinter, без него окно программы не открыть.\n\n"
+        "Windows: переустановите Python с сайта python.org, не снимая\n"
+        "         галочку «tcl/tk and IDLE» в списке компонентов.\n"
+        "Linux:   sudo apt install python3-tk\n"
+        "macOS:   установите Python с python.org (в системном его нет)\n"
+    )
+    try:
+        input("Нажмите Enter, чтобы закрыть окно...")
+    except EOFError:
+        pass
+    raise SystemExit(1) from None
 
 from checker.config import CONFIG_PATH, load_config, save_config
 from checker.dates import fmt_date, parse_deadline

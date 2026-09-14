@@ -5,3 +5,5 @@ checker.log
 .venv/
 venv/
 .DS_Store
+diagnose.txt
+diagnose-*.png

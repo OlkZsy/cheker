@@ -29,6 +29,9 @@ DEFAULT_CONFIG: dict = {
     "sound": True,
     # Сколько секунд ждать ответа сайта.
     "timeout_seconds": 60,
+    # Путь к своему браузеру. Пусто — искать Chromium от Playwright,
+    # затем установленные в системе Chrome и Edge.
+    "browser_path": "",
     "sites": [
         {
             "name": "Варшава, Єрусалимські алеї 179",
