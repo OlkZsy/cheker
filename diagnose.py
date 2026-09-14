@@ -98,7 +98,7 @@ def main() -> int:
     with sync_playwright() as playwright:
         # Тот же профиль, что и у самой программы: пройденная проверка
         # Cloudflare общая, и подтверждать «я не робот» лишний раз не нужно.
-        context = _open_context(playwright, config, headless=False)
+        context, attached = _open_context(playwright, config, headless=False)
         page = context.pages[0] if context.pages else context.new_page()
 
         traffic: list[str] = []
@@ -197,7 +197,8 @@ def main() -> int:
             page.screenshot(path=str(OUT_PATH.with_name(f"diagnose-{number}.png")))
             report.write(f"  снимок экрана: diagnose-{number}.png")
 
-        context.close()
+        if not attached:
+            context.close()
 
     report.write("")
     report.write("=" * 70)

@@ -35,7 +35,7 @@ USER_AGENT = (
 # Сколько услуг максимум перебирать, если в настройках не задана конкретная.
 MAX_SERVICES = 8
 # Сколько ждать появления списка дат после выбора услуги.
-DAYS_WAIT_SECONDS = 25
+DAYS_WAIT_SECONDS = 20
 
 _CONSENT_TEXTS = ("Прийняти", "Приймаю", "Погоджуюсь", "Зрозуміло", "Accept", "Согласен", "OK")
 
@@ -155,9 +155,11 @@ _JS_SELECTS = r"""
 class BrowserSession:
     """Одно окно браузера на всё время работы программы.
 
-    Постоянное окно решает сразу две задачи: пройденная человеком проверка
-    Cloudflare не теряется между проверками, и сайт не дёргается лишними
-    запусками браузера.
+    У каждого города своя вкладка, и она остаётся открытой между проверками.
+    Повторная проверка не перезагружает страницу: программа просто заново
+    выбирает услугу в уже открытой форме, и сайт сам подгружает свежие дни.
+    Так на сайт уходит на порядок меньше обращений, а Cloudflare реже просит
+    подтвердить, что вы не робот.
     """
 
     def __init__(self, config: dict, log=lambda message: None, should_stop=lambda: False):
@@ -167,7 +169,9 @@ class BrowserSession:
         self.should_stop = should_stop
         self._playwright = None
         self._context = None
-        self._page = None
+        self._attached = False
+        self._pages: dict[str, object] = {}
+        self._spare_pages: list = []
         self._headless: bool | None = None
 
     # -- жизненный цикл -------------------------------------------------
@@ -178,7 +182,7 @@ class BrowserSession:
     def ensure_open(self) -> None:
         """Открыть окно, а если в настройках сменился режим — переоткрыть."""
         wanted = bool(self.config.get("headless", False))
-        if self._context is not None and wanted != self._headless:
+        if self._context is not None and not self._attached and wanted != self._headless:
             self.log("Режим окна браузера изменился — перезапускаю браузер")
             self.close()
         if self._context is None:
@@ -195,24 +199,36 @@ class BrowserSession:
 
         self._playwright = sync_playwright().start()
         try:
-            self._context = _open_context(self._playwright, self.config, headless)
+            self._context, self._attached = _open_context(self._playwright, self.config, headless)
         except Exception:
             self._stop_playwright()
             raise
 
         self._headless = headless
-        pages = self._context.pages
-        self._page = pages[0] if pages else self._context.new_page()
-        self._page.set_default_timeout(int(self.config.get("timeout_seconds", 60)) * 1000)
+        self._pages = {}
+        # Чужие вкладки не трогаем: в своём браузере переиспользуем пустую,
+        # в подключённом Chrome всегда открываем новую.
+        self._spare_pages = [] if self._attached else list(self._context.pages)
+        if self._attached:
+            self.log("Подключился к вашему Chrome")
 
     def close(self) -> None:
-        if self._context is not None:
+        if self._attached:
+            # Чужой браузер не закрываем — только свои вкладки.
+            for page in self._pages.values():
+                try:
+                    page.close()
+                except Exception:
+                    pass
+        elif self._context is not None:
             try:
                 self._context.close()
             except Exception:
                 pass
         self._context = None
-        self._page = None
+        self._pages = {}
+        self._spare_pages = []
+        self._attached = False
         self._headless = None
         self._stop_playwright()
 
@@ -224,9 +240,24 @@ class BrowserSession:
                 pass
         self._playwright = None
 
+    def _page_for(self, url: str):
+        """Своя вкладка для каждого города — чтобы города не мешали друг другу."""
+        page = self._pages.get(url)
+        if page is not None:
+            try:
+                if not page.is_closed():
+                    return page
+            except Exception:
+                pass
+
+        page = self._spare_pages.pop(0) if self._spare_pages else self._context.new_page()
+        page.set_default_timeout(int(self.config.get("timeout_seconds", 60)) * 1000)
+        self._pages[url] = page
+        return page
+
     # -- проверка сайта -------------------------------------------------
     def check(self, site: dict) -> SiteResult:
-        """Открыть страницу, перебрать услуги и собрать даты."""
+        """Открыть форму (если ещё не открыта), перебрать услуги и собрать даты."""
         name = site.get("name") or site["url"]
         url = site["url"]
         wanted = (site.get("service") or "").strip()
@@ -234,13 +265,15 @@ class BrowserSession:
 
         self.ensure_open()
         timeout_ms = int(self.config.get("timeout_seconds", 60)) * 1000
+        page = self._page_for(url)
 
-        self._open_page(url, name, timeout_ms)
-        selects = self._page.evaluate(_JS_SELECTS)
+        self._ensure_form(page, url, name, timeout_ms)
+
+        selects = page.evaluate(_JS_SELECTS)
         service_select = _find_service_select(selects)
 
         if service_select is None:
-            if _NO_SLOTS_RE.search(self._page_text()):
+            if _NO_SLOTS_RE.search(self._page_text(page)):
                 result.services = [ServiceResult("(услуги не предлагаются)", [], "сайт пишет, что мест нет")]
                 result.ok = True
                 self.log(f"[{name}] сайт пишет, что свободных мест нет")
@@ -260,26 +293,18 @@ class BrowserSession:
             )
             raise ScraperError(f"услуга «{wanted}» не найдена. Доступны: {available or 'нет вариантов'}")
 
-        for position, option in enumerate(options):
-            if position > 0:
-                # Перезагружаем страницу, чтобы форма не тянула состояние прошлой услуги.
-                self._open_page(url, name, timeout_ms)
-                selects = self._page.evaluate(_JS_SELECTS)
-                service_select = _find_service_select(selects) or service_select
-
-            dates, note = self._pick_service_dates(service_select, option, name)
+        for option in options:
+            if self.should_stop():
+                raise ScraperError("проверка прервана")
+            dates, note = self._check_service(page, service_select, option, name)
             result.services.append(ServiceResult(option["text"], dates, note))
 
         result.ok = True
         return result
 
-    def _pick_service_dates(self, service_select: dict, option: dict, name: str) -> tuple[list[dt.date], str]:
-        """Выбрать услугу и дождаться, пока подгрузится список дат."""
-        locator = self._page.locator("select").nth(service_select["index"])
-        if option["value"]:
-            locator.select_option(value=option["value"])
-        else:
-            locator.select_option(label=option["text"])
+    def _check_service(self, page, service_select: dict, option: dict, name: str) -> tuple[list[dt.date], str]:
+        """Выбрать услугу как человек и дождаться списка дней."""
+        self._select_service(page, service_select, option)
 
         deadline_ts = time.monotonic() + DAYS_WAIT_SECONDS
         dates: list[dt.date] = []
@@ -288,73 +313,125 @@ class BrowserSession:
         while time.monotonic() < deadline_ts:
             if self.should_stop():
                 raise ScraperError("проверка прервана")
-            self._page.wait_for_timeout(700)
+            page.wait_for_timeout(600)
 
-            if self._challenge_visible():
-                self._wait_for_human(name)
-                note = "после проверки Cloudflare страница перезагружена"
+            if self._challenge_visible(page):
+                self._wait_for_human(page, name)
+                note = "страница прошла проверку Cloudflare"
                 break
 
-            fresh = self._page.evaluate(_JS_SELECTS)
-            dates = _collect_dates(fresh, skip=service_select)
-            if dates:
-                break
+            day_select = _find_day_select(page.evaluate(_JS_SELECTS), service_select)
+            if day_select is not None:
+                dates = _dates_of(day_select)
+                if dates:
+                    break
+                # Список дней появился, но дат в нём нет — ждать больше нечего.
+                if day_select["visible"] and _has_real_options(day_select):
+                    note = "в списке дней нет ни одной даты"
+                    break
 
             # Сайт прямо пишет, когда мест нет, — не ждём молча весь таймаут.
-            if _NO_SLOTS_RE.search(self._page_text()):
+            if _NO_SLOTS_RE.search(self._page_text(page)):
                 note = "сайт пишет, что свободных мест нет"
                 break
 
         if not dates and not note:
-            note = "свободных дат нет"
+            note = "список дней так и не появился"
 
         self.log(f"[{name}] {option['text']}: найдено дат — {len(dates)}" + (f" ({note})" if note else ""))
         return dates, note
 
-    # -- вспомогательное ------------------------------------------------
-    def _open_page(self, url: str, name: str, timeout_ms: int) -> None:
-        self._page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-        self._page.wait_for_timeout(1500)
-        if self._challenge_visible():
-            self._wait_for_human(name)
-        _dismiss_consent(self._page)
-        try:
-            self._page.wait_for_selector("select", timeout=min(timeout_ms, 30000))
-        except Exception as exc:
-            if self._challenge_visible():
-                self._wait_for_human(name)
-                return
-            raise ScraperError("на странице не появилась форма записи") from exc
+    def _select_service(self, page, service_select: dict, option: dict) -> None:
+        """Выбрать услугу в списке так же, как это сделал бы человек.
 
-    def _page_text(self) -> str:
+        Сначала сбрасываем список на «- Обрати -»: если услуга уже выбрана с
+        прошлой проверки, повторный выбор того же пункта не вызовет события
+        change, и сайт не станет запрашивать свежие дни.
+        """
+        locator = page.locator("select").nth(service_select["index"])
         try:
-            return self._page.evaluate("() => document.body ? document.body.innerText : ''") or ""
+            locator.scroll_into_view_if_needed(timeout=3000)
+        except Exception:
+            pass
+
+        try:
+            locator.select_option(value="")
+            page.wait_for_timeout(400)
+        except Exception:
+            pass  # у некоторых форм пустого пункта нет — не беда
+
+        if option["value"]:
+            locator.select_option(value=option["value"])
+        else:
+            locator.select_option(label=option["text"])
+
+    # -- вспомогательное ------------------------------------------------
+    def _ensure_form(self, page, url: str, name: str, timeout_ms: int) -> None:
+        """Убедиться, что перед нами форма записи.
+
+        Если вкладка уже на форме, страница НЕ перезагружается — это главный
+        способ не дёргать Cloudflare лишний раз. Заново открываем только
+        тогда, когда формы нет: первый запуск, проверка «я не робот» или
+        сайт увёл нас куда-то ещё.
+        """
+        for attempt in (1, 2):
+            if self.should_stop():
+                raise ScraperError("проверка прервана")
+
+            if self._challenge_visible(page):
+                self._wait_for_human(page, name)
+
+            if self._has_form(page):
+                if attempt > 1:
+                    _dismiss_consent(page)
+                return
+
+            self.log(f"[{name}] открываю страницу заново")
+            page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            page.wait_for_timeout(1500)
+            if self._challenge_visible(page):
+                self._wait_for_human(page, name)
+            _dismiss_consent(page)
+
+        if self._has_form(page):
+            return
+        raise ScraperError("на странице не появилась форма записи")
+
+    def _has_form(self, page) -> bool:
+        try:
+            return page.locator("select").count() > 0
+        except Exception:
+            return False
+
+    def _page_text(self, page) -> str:
+        try:
+            return page.evaluate("() => document.body ? document.body.innerText : ''") or ""
         except Exception:
             return ""
 
-    def _challenge_visible(self) -> bool:
+    def _challenge_visible(self, page) -> bool:
         """Отличить заглушку Cloudflare от настоящей страницы записи."""
         try:
-            title = (self._page.title() or "").lower()
+            title = (page.title() or "").lower()
         except Exception:
             return False
         if any(marker in title for marker in _CHALLENGE_TITLES):
             return True
         try:
-            if self._page.locator(_CHALLENGE_SELECTORS).count():
+            if page.locator(_CHALLENGE_SELECTORS).count():
                 return True
         except Exception:
             pass
-        text = self._page_text().lower()
+        text = self._page_text(page).lower()
         return any(marker in text for marker in _CHALLENGE_TEXTS)
 
-    def _wait_for_human(self, name: str) -> None:
+    def _wait_for_human(self, page, name: str) -> None:
         """Дождаться, пока проверку «я не робот» пройдёт человек.
 
         Программа сознательно ничего не обходит: она лишь ждёт, пока галочку
         поставят руками, и продолжает в уже подтверждённой сессии.
         """
-        if self._headless:
+        if self._headless and not self._attached:
             raise ChallengeError(
                 "сайт просит подтвердить, что вы не робот. Снимите галочку "
                 "«Скрывать окно браузера» и нажмите «Проверить сейчас» — "
@@ -367,7 +444,7 @@ class BrowserSession:
             f"Поставьте галочку в открытом окне браузера — жду до {seconds} с."
         )
         try:
-            self._page.bring_to_front()
+            page.bring_to_front()
         except Exception:
             pass
 
@@ -375,10 +452,10 @@ class BrowserSession:
         while time.monotonic() < deadline_ts:
             if self.should_stop():
                 raise ScraperError("ожидание проверки прервано")
-            self._page.wait_for_timeout(1000)
-            if not self._challenge_visible():
+            page.wait_for_timeout(1000)
+            if not self._challenge_visible(page):
                 self.log(f"[{name}] проверка пройдена, продолжаю")
-                self._page.wait_for_timeout(1500)
+                page.wait_for_timeout(1500)
                 return
 
         raise ChallengeError(
@@ -388,11 +465,26 @@ class BrowserSession:
 
 
 def _open_context(playwright, config: dict, headless: bool):
-    """Открыть браузер с постоянным профилем.
+    """Открыть браузер и сказать, свой он или чужой.
 
-    Профиль на диске хранит cookie пройденной проверки Cloudflare, поэтому
-    подтверждать «я не робот» приходится редко, а не каждые 15 минут.
+    Возвращает (контекст, attached). attached=True означает, что мы
+    подключились к уже запущенному Chrome пользователя — такой браузер
+    закрывать нельзя, он не наш.
     """
+    cdp = (config.get("cdp_url") or "").strip()
+    if cdp:
+        try:
+            browser = playwright.chromium.connect_over_cdp(cdp)
+        except Exception as exc:
+            raise ScraperError(
+                f"не удалось подключиться к вашему Chrome по адресу {cdp}. "
+                "Запустите chrome-debug.bat и не закрывайте окно Chrome. "
+                f"({_short(str(exc), 100)})"
+            ) from exc
+        if not browser.contexts:
+            raise ScraperError("в подключённом Chrome нет ни одного окна")
+        return browser.contexts[0], True
+
     profile = Path(config.get("profile_dir") or DEFAULT_PROFILE_DIR)
     profile.mkdir(parents=True, exist_ok=True)
 
@@ -415,7 +507,7 @@ def _open_context(playwright, config: dict, headless: bool):
     problems = []
     for title, extra in attempts:
         try:
-            return playwright.chromium.launch_persistent_context(str(profile), **options, **extra)
+            return playwright.chromium.launch_persistent_context(str(profile), **options, **extra), False
         except Exception as exc:
             problems.append(f"{title}: {_short(str(exc), 120)}")
 
@@ -519,6 +611,50 @@ def _collect_dates(selects: list[dict], skip: dict | None) -> list[dt.date]:
             if value:
                 found.add(value)
     return sorted(found)
+
+
+def _find_day_select(selects: list[dict], service_select: dict) -> dict | None:
+    """Найти именно список дней, а не список часов и не список услуг.
+
+    Сначала по подписи («Обрати день»), затем по имени поля, и лишь в
+    последнюю очередь — по наличию дат внутри.
+    """
+    others = [select for select in selects if not _same_select(select, service_select)]
+
+    for select in others:
+        label = select["label"].lower()
+        if "день" in label or "дні" in label or "дата" in label or "дату" in label:
+            return select
+
+    for select in others:
+        if select["id"].lower() in ("date", "day") or select["name"].lower() in ("date", "day"):
+            return select
+
+    for select in others:
+        if _dates_of(select):
+            return select
+
+    return None
+
+
+def _dates_of(select: dict) -> list[dt.date]:
+    """Даты из одного выпадающего списка."""
+    found: set[dt.date] = set()
+    for option in select["options"]:
+        if option["disabled"]:
+            continue
+        value = parse_date(option["text"]) or parse_date(option["value"])
+        if value:
+            found.add(value)
+    return sorted(found)
+
+
+def _has_real_options(select: dict) -> bool:
+    """Есть ли в списке хоть один пункт, кроме «- Обрати -»."""
+    return any(
+        not option["disabled"] and not is_placeholder(option["text"], option["value"])
+        for option in select["options"]
+    )
 
 
 def _same_select(candidate: dict, target: dict) -> bool:

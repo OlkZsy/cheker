@@ -48,6 +48,9 @@ COLOR_MISS = "#f1f3f4"
 COLOR_ERROR = "#ffd9c7"
 COLOR_HUMAN = "#ffe9a8"
 
+# Адрес, по которому chrome-debug.bat открывает браузер.
+CHROME_CDP_URL = "http://127.0.0.1:9222"
+
 
 class App(tk.Tk):
     def __init__(self):
@@ -104,6 +107,13 @@ class App(tk.Tk):
         ttk.Combobox(
             settings, textvariable=self.mode_var, values=["browser", "http"], width=10, state="readonly"
         ).grid(row=1, column=3, sticky="w", **padding)
+
+        self.own_chrome_var = tk.BooleanVar()
+        ttk.Checkbutton(
+            settings,
+            text="Использовать свой Chrome (сначала запустите chrome-debug.bat)",
+            variable=self.own_chrome_var,
+        ).grid(row=2, column=0, columnspan=4, sticky="w", **padding)
 
         main_buttons = ttk.Frame(self)
         main_buttons.pack(fill="x", padx=10)
@@ -170,6 +180,7 @@ class App(tk.Tk):
         self.headless_var.set(bool(self.config_data.get("headless", True)))
         self.sound_var.set(bool(self.config_data.get("sound", True)))
         self.mode_var.set(str(self.config_data.get("mode", "browser")))
+        self.own_chrome_var.set(bool((self.config_data.get("cdp_url") or "").strip()))
 
     def _collect_settings(self) -> bool:
         """Перенести значения из полей в настройки. False — если введена ерунда."""
@@ -193,6 +204,7 @@ class App(tk.Tk):
         self.config_data["headless"] = bool(self.headless_var.get())
         self.config_data["sound"] = bool(self.sound_var.get())
         self.config_data["mode"] = self.mode_var.get() or "browser"
+        self.config_data["cdp_url"] = CHROME_CDP_URL if self.own_chrome_var.get() else ""
         return True
 
     # ------------------------------------------------------------------
