@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import datetime as dt
+import queue
 import threading
 from dataclasses import dataclass, field
 
 from .config import enabled_sites
 from .dates import fmt_date, parse_deadline
 from .notify import notify
-from .scraper import SiteResult, check_site
+from .scraper import BrowserSession, SiteResult, check_site
 
 
 @dataclass
@@ -39,6 +40,11 @@ class CheckRound:
     def has_errors(self) -> bool:
         return any(not result.ok for result in self.results)
 
+    @property
+    def needs_human(self) -> bool:
+        """Хотя бы один сайт ждёт, что проверку «я не робот» пройдёт человек."""
+        return any(result.needs_human for result in self.results)
+
 
 class Notifier:
     """Следит, чтобы об одной и той же дате не сообщать каждые пять минут."""
@@ -63,7 +69,13 @@ class Notifier:
         self._last_sent.clear()
 
 
-def run_check(config: dict, log=lambda message: None, notifier: Notifier | None = None) -> CheckRound:
+def run_check(
+    config: dict,
+    log=lambda message: None,
+    notifier: Notifier | None = None,
+    session: BrowserSession | None = None,
+    should_stop=lambda: False,
+) -> CheckRound:
     """Обойти все включённые сайты и вернуть результат круга проверки."""
     deadline = parse_deadline(config.get("deadline", "02.10.2026"))
     round_result = CheckRound()
@@ -76,23 +88,26 @@ def run_check(config: dict, log=lambda message: None, notifier: Notifier | None 
     log(f"Проверяю сайты ({len(sites)} шт.), ищу даты не позже {fmt_date(deadline)}")
 
     for site in sites:
+        if should_stop():
+            log("Проверка прервана.")
+            break
         name = site.get("name") or site["url"]
         try:
-            result = check_site(site, config, log)
+            result = check_site(site, config, log, session)
         except Exception as exc:  # проверка одного сайта не должна ронять остальные
             result = SiteResult(name=name, url=site["url"], ok=False, error=f"{type(exc).__name__}: {exc}")
 
         round_result.results.append(result)
 
         if not result.ok:
-            log(f"[{name}] ОШИБКА: {result.error}")
+            if not result.needs_human:
+                log(f"[{name}] ОШИБКА: {result.error}")
             continue
 
         for service, date_value in result.matches(deadline):
             round_result.matches.append(Match(name, service, date_value, site["url"]))
 
-        earliest = result.earliest
-        log(f"[{name}] ближайшая дата: {fmt_date(earliest)} (всего дат: {len(result.all_dates)})")
+        log(f"[{name}] ближайшая дата: {fmt_date(result.earliest)} (всего дат: {len(result.all_dates)})")
 
     if notifier is not None and round_result.matches:
         round_result.new_matches = notifier.filter_new(round_result.matches)
@@ -101,7 +116,7 @@ def run_check(config: dict, log=lambda message: None, notifier: Notifier | None 
 
     if round_result.matches:
         log(f"НАЙДЕНО подходящих дат: {len(round_result.matches)}")
-    else:
+    elif not round_result.needs_human:
         log("Подходящих дат пока нет.")
 
     return round_result
@@ -119,43 +134,105 @@ def send_notification(matches: list[Match], config: dict, log=lambda message: No
     log(("Уведомление отправлено: " if delivered else "Уведомление показать не удалось: ") + " / ".join(lines))
 
 
-class Monitor(threading.Thread):
-    """Фоновый поток: проверяет сайты по кругу с заданным интервалом."""
+class Worker(threading.Thread):
+    """Единственный поток, который ходит в браузер.
 
-    def __init__(self, config: dict, on_event, lock: threading.Lock | None = None,
-                 notifier: Notifier | None = None):
+    Все проверки — и разовые, и по расписанию — идут через него: Playwright
+    привязан к потоку, в котором создан, а одно постоянное окно браузера
+    хранит пройденную проверку Cloudflare между проверками.
+    """
+
+    def __init__(self, config: dict, on_event):
         super().__init__(daemon=True)
         self.config = config
         self.on_event = on_event
-        self.lock = lock or threading.Lock()
-        self.notifier = notifier or Notifier(int(config.get("notify_repeat_minutes", 120)))
-        self._stop = threading.Event()
-        self._wake = threading.Event()
+        self.notifier = Notifier(int(config.get("notify_repeat_minutes", 120)))
+        self.monitoring = False
+        self._commands: queue.Queue = queue.Queue()
+        self._busy = threading.Event()
+        self._shutting_down = False
+        self._session: BrowserSession | None = None
 
+    # -- команды снаружи ------------------------------------------------
+    def check_now(self) -> None:
+        """Проверить прямо сейчас, не дожидаясь конца интервала."""
+        self._commands.put("check")
+
+    def start_monitoring(self) -> None:
+        self.monitoring = True
+        self._commands.put("check")
+
+    def stop_monitoring(self) -> None:
+        self.monitoring = False
+        self._commands.put("reschedule")
+
+    def shutdown(self) -> None:
+        self.monitoring = False
+        # Флаг обрывает долгое ожидание внутри проверки, чтобы окно браузера
+        # закрылось сразу, а не через три минуты.
+        self._shutting_down = True
+        self._commands.put("stop")
+
+    @property
+    def busy(self) -> bool:
+        return self._busy.is_set()
+
+    # -- сам поток ------------------------------------------------------
     def run(self) -> None:
-        while not self._stop.is_set():
-            self._run_once()
-            if self._stop.is_set():
-                break
-            interval = max(1, int(self.config.get("interval_minutes", 15))) * 60
-            self.on_event("next", interval)
-            self._wake.wait(interval)
-            self._wake.clear()
+        try:
+            while True:
+                timeout = self._interval_seconds() if self.monitoring else None
+                try:
+                    command = self._commands.get(timeout=timeout)
+                except queue.Empty:
+                    command = "check"  # истёк интервал слежения
+
+                if command == "stop":
+                    break
+                if command == "reschedule":
+                    continue
+                if command == "check":
+                    self._run_once()
+                    if self.monitoring:
+                        self.on_event("next", self._interval_seconds())
+        finally:
+            self._close_session()
 
     def _run_once(self) -> None:
-        with self.lock:
-            self.on_event("started", None)
-            try:
-                round_result = run_check(self.config, lambda message: self.on_event("log", message), self.notifier)
-                self.on_event("finished", round_result)
-            except Exception as exc:
-                self.on_event("log", f"Проверка прервана: {type(exc).__name__}: {exc}")
-                self.on_event("finished", CheckRound())
+        self._busy.set()
+        self.on_event("started", None)
+        try:
+            round_result = run_check(
+                self.config,
+                lambda message: self.on_event("log", message),
+                self.notifier,
+                self._ensure_session(),
+                should_stop=lambda: self._shutting_down,
+            )
+            self.on_event("finished", round_result)
+        except Exception as exc:
+            self.on_event("log", f"Проверка прервана: {type(exc).__name__}: {exc}")
+            self._close_session()  # окно могло остаться в неизвестном состоянии
+            self.on_event("finished", None)
+        finally:
+            self._busy.clear()
 
-    def check_now(self) -> None:
-        """Не ждать конца интервала — проверить прямо сейчас."""
-        self._wake.set()
+    def _ensure_session(self) -> BrowserSession | None:
+        if (self.config.get("mode") or "browser").lower() == "http":
+            self._close_session()
+            return None
+        if self._session is None:
+            self._session = BrowserSession(
+                self.config,
+                lambda message: self.on_event("log", message),
+                should_stop=lambda: self._shutting_down,
+            )
+        return self._session
 
-    def stop(self) -> None:
-        self._stop.set()
-        self._wake.set()
+    def _close_session(self) -> None:
+        if self._session is not None:
+            self._session.close()
+            self._session = None
+
+    def _interval_seconds(self) -> int:
+        return max(1, int(self.config.get("interval_minutes", 15))) * 60

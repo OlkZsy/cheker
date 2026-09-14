@@ -21,7 +21,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from checker.config import load_config
-from checker.scraper import _JS_SELECTS, _find_service_select, is_placeholder
+from checker.scraper import _JS_SELECTS, _find_service_select, _open_context, is_placeholder
 
 OUT_PATH = Path(__file__).resolve().parent / "diagnose.txt"
 MAX_SERVICES = 3
@@ -96,11 +96,10 @@ def main() -> int:
     report.write("=" * 70)
 
     with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(
-            headless=False, **({"executable_path": config["browser_path"]} if config.get("browser_path") else {})
-        )
-        context = browser.new_context(locale="uk-UA", viewport={"width": 1280, "height": 900})
-        page = context.new_page()
+        # Тот же профиль, что и у самой программы: пройденная проверка
+        # Cloudflare общая, и подтверждать «я не робот» лишний раз не нужно.
+        context = _open_context(playwright, config, headless=False)
+        page = context.pages[0] if context.pages else context.new_page()
 
         traffic: list[str] = []
 
@@ -136,7 +135,20 @@ def main() -> int:
                 report.write(f"  НЕ ОТКРЫЛСЯ: {type(exc).__name__}: {exc}")
                 continue
 
-            report.write(f"  заголовок вкладки: {page.title()!r}")
+            title = page.title()
+            report.write(f"  заголовок вкладки: {title!r}")
+            if any(mark in title.lower() for mark in ("just a moment", "трохи зачекайте")):
+                report.write("  ЭТО ЗАГЛУШКА CLOUDFLARE — поставьте галочку в окне браузера")
+                print("\n>>> Поставьте галочку «Підтвердьте, що ви людина» в окне браузера.", flush=True)
+                for _ in range(60):
+                    page.wait_for_timeout(2000)
+                    if not any(m in page.title().lower() for m in ("just a moment", "трохи зачекайте")):
+                        report.write("  проверка пройдена, продолжаю")
+                        page.wait_for_timeout(2000)
+                        break
+                else:
+                    report.write("  проверку так и не прошли")
+                    continue
             selects = page.evaluate(_JS_SELECTS)
             describe_selects(report, selects, "ДО выбора услуги")
             dump_html(report, page, selects)
@@ -185,7 +197,7 @@ def main() -> int:
             page.screenshot(path=str(OUT_PATH.with_name(f"diagnose-{number}.png")))
             report.write(f"  снимок экрана: diagnose-{number}.png")
 
-        browser.close()
+        context.close()
 
     report.write("")
     report.write("=" * 70)

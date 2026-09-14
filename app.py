@@ -32,9 +32,9 @@ except ImportError:  # Python без tcl/tk — окно построить не
         pass
     raise SystemExit(1) from None
 
-from checker.config import CONFIG_PATH, load_config, save_config
+from checker.config import CONFIG_PATH, DEFAULT_SERVICE, load_config, save_config
 from checker.dates import fmt_date, parse_deadline
-from checker.engine import Monitor, Notifier, run_check
+from checker.engine import Worker
 from checker.notify import SYSTEM
 
 APP_TITLE = "Pasport Checker — запись в электронную очередь"
@@ -46,6 +46,7 @@ COLOR_BUSY = "#d6e4ff"
 COLOR_HIT = "#b7f0c2"
 COLOR_MISS = "#f1f3f4"
 COLOR_ERROR = "#ffd9c7"
+COLOR_HUMAN = "#ffe9a8"
 
 
 class App(tk.Tk):
@@ -57,11 +58,13 @@ class App(tk.Tk):
 
         self.config_data = load_config()
         self.events: queue.Queue = queue.Queue()
-        self.check_lock = threading.Lock()
-        self.notifier = Notifier(int(self.config_data.get("notify_repeat_minutes", 120)))
-        self.monitor: Monitor | None = None
         self.next_check_at: dt.datetime | None = None
         self.row_sites: dict[str, dict] = {}
+
+        # Все проверки идут через один поток: Playwright привязан к потоку,
+        # в котором создан, а окно браузера живёт между проверками.
+        self.worker = Worker(self.config_data, self._push_event)
+        self.worker.start()
 
         self._build_ui()
         self._load_settings_into_widgets()
@@ -113,7 +116,9 @@ class App(tk.Tk):
 
         extra_buttons = ttk.Frame(self)
         extra_buttons.pack(fill="x", padx=10, pady=(6, 0))
-        ttk.Button(extra_buttons, text="Вкл/выкл сайт", command=self.toggle_selected_site).pack(side="left", padx=(0, 6))
+        ttk.Button(extra_buttons, text="Добавить сайт", command=self.add_site).pack(side="left", padx=(0, 6))
+        ttk.Button(extra_buttons, text="Удалить сайт", command=self.remove_selected_site).pack(side="left", padx=6)
+        ttk.Button(extra_buttons, text="Вкл/выкл сайт", command=self.toggle_selected_site).pack(side="left", padx=6)
         ttk.Button(extra_buttons, text="Открыть config.json", command=self.open_config_file).pack(side="left", padx=6)
         ttk.Button(extra_buttons, text="Установить браузер", command=self.install_browser).pack(side="left", padx=6)
 
@@ -142,6 +147,7 @@ class App(tk.Tk):
             self.tree.column(column, width=width, anchor="w")
         self.tree.tag_configure("hit", background=COLOR_HIT)
         self.tree.tag_configure("error", background=COLOR_ERROR)
+        self.tree.tag_configure("human", background=COLOR_HUMAN)
         self.tree.tag_configure("off", foreground="#888888")
         self.tree.pack(fill="x", padx=10)
 
@@ -202,9 +208,8 @@ class App(tk.Tk):
             messagebox.showerror("Не удалось сохранить", str(exc))
 
     def toggle_monitor(self) -> None:
-        if self.monitor and self.monitor.is_alive():
-            self.monitor.stop()
-            self.monitor = None
+        if self.worker.monitoring:
+            self.worker.stop_monitoring()
             self.next_check_at = None
             self.start_button.configure(text="Старт")
             self.status_var.set("Остановлено")
@@ -213,9 +218,8 @@ class App(tk.Tk):
 
         if not self._collect_settings():
             return
-        self.notifier.repeat_minutes = int(self.config_data.get("notify_repeat_minutes", 120))
-        self.monitor = Monitor(self.config_data, self._push_event, self.check_lock, self.notifier)
-        self.monitor.start()
+        self.worker.notifier.repeat_minutes = int(self.config_data.get("notify_repeat_minutes", 120))
+        self.worker.start_monitoring()
         self.start_button.configure(text="Стоп")
         self.log(
             f"Слежение запущено: проверка каждые {self.config_data['interval_minutes']} мин., "
@@ -225,26 +229,10 @@ class App(tk.Tk):
     def check_now(self) -> None:
         if not self._collect_settings():
             return
-        if self.monitor and self.monitor.is_alive():
-            self.monitor.check_now()
-            self.log("Проверка запущена вне очереди.")
-            return
-        if self.check_lock.locked():
+        if self.worker.busy:
             self.log("Проверка уже идёт, подождите.")
             return
-        threading.Thread(target=self._single_check, daemon=True).start()
-
-    def _single_check(self) -> None:
-        with self.check_lock:
-            self._push_event("started", None)
-            try:
-                round_result = run_check(
-                    self.config_data, lambda message: self._push_event("log", message), self.notifier
-                )
-                self._push_event("finished", round_result)
-            except Exception as exc:
-                self._push_event("log", f"Проверка прервана: {type(exc).__name__}: {exc}")
-                self._push_event("finished", None)
+        self.worker.check_now()
 
     def open_selected_site(self) -> None:
         site = self._selected_site()
@@ -262,6 +250,29 @@ class App(tk.Tk):
         name = site.get("name") or site.get("url", "")
         self.log(f"Сайт «{name}»: {'включён' if site['enabled'] else 'выключен'}")
         self._refresh_table()
+
+    def add_site(self) -> None:
+        """Добавить ещё один адрес, не открывая config.json."""
+        dialog = AddSiteDialog(self)
+        self.wait_window(dialog)
+        site = dialog.result
+        if site is None:
+            return
+        self.config_data.setdefault("sites", []).append(site)
+        self._refresh_table()
+        self.log(f"Добавлен сайт «{site['name']}». Нажмите «Сохранить настройки», чтобы он остался после перезапуска.")
+
+    def remove_selected_site(self) -> None:
+        site = self._selected_site()
+        if site is None:
+            messagebox.showinfo("Выберите сайт", "Сначала выделите строку с сайтом в таблице.")
+            return
+        name = site.get("name") or site.get("url", "")
+        if not messagebox.askyesno("Удалить сайт", f"Убрать «{name}» из списка?"):
+            return
+        self.config_data["sites"] = [item for item in self.config_data.get("sites", []) if item is not site]
+        self._refresh_table()
+        self.log(f"Сайт «{name}» удалён из списка.")
 
     def open_config_file(self) -> None:
         if not CONFIG_PATH.exists():
@@ -353,6 +364,12 @@ class App(tk.Tk):
             self._set_banner(text, COLOR_HIT)
             if round_result.new_matches:
                 self._raise_window()
+        elif round_result.needs_human:
+            self._set_banner(
+                "Сайт просит подтвердить, что вы не робот — поставьте галочку в окне браузера",
+                COLOR_HUMAN,
+            )
+            self._raise_window()
         elif round_result.has_errors:
             self._set_banner("Часть сайтов не проверилась — смотрите журнал", COLOR_ERROR)
         else:
@@ -387,6 +404,9 @@ class App(tk.Tk):
                 values, tags = (name, "выключен", "—", "—", "—"), ("off",)
             elif result is None:
                 values, tags = (name, "ещё не проверялся", "—", "—", "—"), ()
+            elif result.needs_human:
+                values, tags = (name, "нужна проверка «я не робот»", "—", "—",
+                                result.checked_at.strftime("%H:%M:%S")), ("human",)
             elif not result.ok:
                 values, tags = (name, f"ошибка: {result.error[:60]}", "—", "—",
                                 result.checked_at.strftime("%H:%M:%S")), ("error",)
@@ -435,15 +455,13 @@ class App(tk.Tk):
             pass
 
     def _tick_countdown(self) -> None:
-        if self.monitor and self.monitor.is_alive():
-            if self.next_check_at:
-                left = int((self.next_check_at - dt.datetime.now()).total_seconds())
-                left = max(0, left)
-                self.status_var.set(f"Слежение включено. Следующая проверка через {left // 60:02d}:{left % 60:02d}")
-            else:
-                self.status_var.set("Слежение включено. Идёт проверка…")
-        elif self.check_lock.locked():
-            self.status_var.set("Идёт разовая проверка…")
+        if self.worker.busy:
+            self.status_var.set("Идёт проверка…")
+        elif self.worker.monitoring and self.next_check_at:
+            left = max(0, int((self.next_check_at - dt.datetime.now()).total_seconds()))
+            self.status_var.set(f"Слежение включено. Следующая проверка через {left // 60:02d}:{left % 60:02d}")
+        elif self.worker.monitoring:
+            self.status_var.set("Слежение включено.")
         else:
             self.status_var.set("Остановлено")
         self.after(1000, self._tick_countdown)
@@ -470,13 +488,91 @@ class App(tk.Tk):
             pass
 
     def on_close(self) -> None:
-        if self.monitor and self.monitor.is_alive():
-            self.monitor.stop()
+        self.worker.shutdown()
+        self.worker.join(timeout=8)  # даём браузеру закрыться
         if self._collect_settings():
             try:
                 save_config(self.config_data)
             except OSError:
                 pass
+        self.destroy()
+
+
+class AddSiteDialog(tk.Toplevel):
+    """Небольшое окно для добавления нового адреса записи."""
+
+    PRESETS = (
+        ("Варшава", "https://warszawa.pasport.org.ua/solutions/e-queue"),
+        ("Гданськ", "https://gdansk.pasport.org.ua/solutions/e-queue"),
+        ("Краків", "https://krakow.pasport.org.ua/solutions/e-queue"),
+        ("Вроцлав", "https://wroclaw.pasport.org.ua/solutions/e-queue"),
+    )
+
+    def __init__(self, parent: "App"):
+        super().__init__(parent)
+        self.title("Добавить сайт")
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+        self.result: dict | None = None
+
+        self.name_var = tk.StringVar()
+        self.url_var = tk.StringVar()
+        self.service_var = tk.StringVar(value=DEFAULT_SERVICE)
+
+        padding = {"padx": 8, "pady": 5}
+        ttk.Label(self, text="Название (как показывать в таблице):").grid(
+            row=0, column=0, sticky="w", **padding
+        )
+        ttk.Entry(self, textvariable=self.name_var, width=46).grid(row=1, column=0, sticky="we", **padding)
+
+        ttk.Label(self, text="Адрес страницы записи:").grid(row=2, column=0, sticky="w", **padding)
+        ttk.Entry(self, textvariable=self.url_var, width=46).grid(row=3, column=0, sticky="we", **padding)
+
+        ttk.Label(self, text="Услуга (часть названия, «*» — все услуги):").grid(
+            row=4, column=0, sticky="w", **padding
+        )
+        ttk.Entry(self, textvariable=self.service_var, width=46).grid(row=5, column=0, sticky="we", **padding)
+
+        presets = ttk.LabelFrame(self, text="Подставить готовый адрес")
+        presets.grid(row=6, column=0, sticky="we", **padding)
+        for index, (city, url) in enumerate(self.PRESETS):
+            ttk.Button(
+                presets,
+                text=city,
+                width=11,
+                command=lambda c=city, u=url: self._use_preset(c, u),
+            ).grid(row=index // 2, column=index % 2, padx=4, pady=4)
+
+        buttons = ttk.Frame(self)
+        buttons.grid(row=7, column=0, sticky="e", **padding)
+        ttk.Button(buttons, text="Добавить", command=self._accept).pack(side="left", padx=4)
+        ttk.Button(buttons, text="Отмена", command=self.destroy).pack(side="left", padx=4)
+
+        self.bind("<Return>", lambda _event: self._accept())
+        self.bind("<Escape>", lambda _event: self.destroy())
+
+    def _use_preset(self, city: str, url: str) -> None:
+        self.name_var.set(city)
+        self.url_var.set(url)
+
+    def _accept(self) -> None:
+        url = self.url_var.get().strip()
+        if not url.startswith(("http://", "https://")):
+            messagebox.showerror(
+                "Неверный адрес",
+                "Адрес должен начинаться с http:// или https://\n\n"
+                "Например: https://krakow.pasport.org.ua/solutions/e-queue",
+                parent=self,
+            )
+            return
+
+        self.result = {
+            "name": self.name_var.get().strip() or url,
+            "url": url,
+            "service": self.service_var.get().strip(),
+            "enabled": True,
+        }
         self.destroy()
 
 
